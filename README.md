@@ -61,24 +61,5 @@ RCOMET_AUG_RATIO   = 0.1
 | OS | Windows 11 / WSL2 Ubuntu 24.04 |
 | Python | 3.10 |
 
----
 
-## Connection to R-CoMET PhD Proposal
-
-This code is a **standalone proof-of-concept**, not yet integrated
-with the CoMET foundation model backbone. The full PhD roadmap:
-
-| Work Package | Status | Description |
-|---|---|---|
-| WP1 — R-CoMET architecture | ~45% | This repo covers Riemannian layers, manifold loss, BNCI eval |
-| WP1 — CoMET integration | Planned | PhD Year 1 at KU Leuven |
-| WP2 — Longitudinal stability | ~15% | GDP metric implemented, drift confirmed |
-| WP3 — TMS-EEG causal validation | Future | Requires KU Leuven infrastructure |
-| WP4 — Optimisation & thesis | Future | PhD Year 3–4 |
-
----
-
-## Citation
-
-If you use this code, please cite the FWO proposal and the
 datasets used:
