@@ -555,7 +555,7 @@ for target in tqdm(subjects, desc="LOSO"):
     except Exception as e:
         print(f"  EA+RCoMET FAILED: {e}")
 
-      #6. GTA+RCoMET (فعلاً کامنت)
+      #6. GTA+RCoMET 
     try:
         clf = PTClassifier(RCoMET(n_ch, n_classes), name="GTA+RCoMET")
         clf.fit(X_gta[src_idx], y_src_full)
@@ -566,7 +566,7 @@ for target in tqdm(subjects, desc="LOSO"):
     except Exception as e:
         print(f"  GTA+RCoMET FAILED: {e}")
 
-    # 7. EA+GTA+RCoMET (فعلاً کامنت)
+    # 7. EA+GTA+RCoMET 
     try:
         clf = PTClassifier(RCoMET(n_ch, n_classes), name="EA+GTA+RCoMET")
         clf.fit(X_eagta[src_idx], y_src_full)
