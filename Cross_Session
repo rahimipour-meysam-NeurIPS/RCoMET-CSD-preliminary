@@ -1,0 +1,592 @@
+import os, gc, warnings
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
+from sklearn.preprocessing import LabelEncoder
+from sklearn.svm import SVC
+from sklearn.decomposition import PCA
+from sklearn.metrics import balanced_accuracy_score, f1_score
+from scipy.signal import csd as scipy_csd
+from tqdm import tqdm
+from mne.filter import filter_data
+from pyriemann.classification import MDM
+from moabb.datasets import PhysionetMI
+from moabb.paradigms import MotorImagery
+from joblib import Parallel, delayed
+
+warnings.filterwarnings("ignore")
+
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["CUDA_LAUNCH_BLOCKING"] = "0"
+
+torch.backends.cudnn.benchmark = True
+torch.set_float32_matmul_precision("high")
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"✓ Device: {DEVICE}")
+
+try:
+    from mamba_ssm import Mamba
+    print("✓ mamba_ssm OK")
+except Exception as e:
+    raise ImportError(f"mamba_ssm import failed: {e}")
+
+# ── Constants ─────────────────────────────────────────────────
+SEEDS            = [42]
+SFREQ            = 250
+TARGET_RMS       = 10.0
+WINDOW           = 30
+N_SUBJECTS       = 25
+MAX_SRC_TRIALS   = 768
+TV_N_COMPONENTS  = 100
+RCOMET_EPOCHS    = 15
+RCOMET_LR        = 1e-3
+RCOMET_BATCH     = 256
+RCOMET_D_MODEL   = 256
+RCOMET_LAYERS    = 3
+RCOMET_D_STATE   = 32
+RCOMET_D_CONV    = 4
+RCOMET_EXPAND    = 2
+RCOMET_DROPOUT   = 0.1
+RCOMET_AUG_RATIO = 0.1
+AUG_SUBSET_SIZE  = 256
+AUG_MAX_SAMPLES  = 32
+
+FREQ_BANDS = [("alpha", 8, 12), ("beta", 13, 30)]
+N_BANDS    = len(FREQ_BANDS)
+_EIG_FLOOR = 1e-12
+
+print(f"✓ Constants OK — N_SUBJECTS={N_SUBJECTS}, EPOCHS={RCOMET_EPOCHS}, BATCH={RCOMET_BATCH}")
+
+# ── GPU SPD Math ──────────────────────────────────────────────
+def torch_logm_batch(X):
+    eigvals, eigvecs = torch.linalg.eigh(X)
+    eigvals = eigvals.clamp(min=_EIG_FLOOR)
+    return (eigvecs * torch.log(eigvals).unsqueeze(-2)) @ eigvecs.transpose(-1, -2)
+
+def torch_invsqrtm_batch(X):
+    eigvals, eigvecs = torch.linalg.eigh(X)
+    eigvals = eigvals.clamp(min=_EIG_FLOOR)
+    return (eigvecs * (eigvals ** -0.5).unsqueeze(-2)) @ eigvecs.transpose(-1, -2)
+
+def torch_sqrtm_batch(X):
+    eigvals, eigvecs = torch.linalg.eigh(X)
+    eigvals = eigvals.clamp(min=_EIG_FLOOR)
+    return (eigvecs * (eigvals ** 0.5).unsqueeze(-2)) @ eigvecs.transpose(-1, -2)
+
+print("✓ GPU SPD Math OK")
+
+# ── CPU SPD Math ──────────────────────────────────────────────
+def _eigh_logm(C):
+    w, v = np.linalg.eigh(C)
+    w = np.maximum(w, _EIG_FLOOR)
+    return v @ np.diag(np.log(w)) @ v.T
+
+def _sqrtm(C):
+    w, v = np.linalg.eigh(C)
+    w = np.maximum(w, _EIG_FLOOR)
+    return v @ np.diag(w ** 0.5) @ v.T
+
+def _invsqrtm(C):
+    w, v = np.linalg.eigh(C)
+    w = np.maximum(w, _EIG_FLOOR)
+    return v @ np.diag(w ** -0.5) @ v.T
+
+def _eigh_expm(L):
+    w, v = np.linalg.eigh(L)
+    return v @ np.diag(np.exp(w)) @ v.T
+
+print("✓ CPU SPD Math OK")
+
+# ── compute_csd_spd ───────────────────────────────────────────
+def _process_single_trial(x_trial, sfreq, freq_bands, nperseg, reg, n_ch, n_bands):
+    eye_reg = reg * np.eye(n_ch)
+    out_trial = np.empty((n_bands, n_ch, n_ch), dtype=np.float32)
+    for bi, (_, f_lo, f_hi) in enumerate(freq_bands):
+        C = np.zeros((n_ch, n_ch), dtype=np.float64)
+        for i in range(n_ch):
+            for j in range(i, n_ch):
+                freqs, Pxy = scipy_csd(
+                    x_trial[i], x_trial[j], fs=sfreq, nperseg=nperseg,
+                    window="hann", scaling="density", detrend="constant",
+                )
+                mask = (freqs >= f_lo) & (freqs <= f_hi)
+                val  = float(np.mean(np.real(Pxy[mask]))) if mask.sum() > 0 else 0.0
+                C[i, j] = val
+                C[j, i] = val
+        C += eye_reg
+        C  = 0.5 * (C + C.T)
+        out_trial[bi] = C.astype(np.float32)
+    return out_trial
+
+def compute_csd_spd(X, sfreq, freq_bands=None, reg=1e-4, nperseg=None):
+    if freq_bands is None:
+        freq_bands = FREQ_BANDS
+    n_trials, n_ch, _ = X.shape
+    n_bands = len(freq_bands)
+    if nperseg is None:
+        nperseg = max(64, int(sfreq // 2))
+    results = Parallel(n_jobs=-1)(
+        delayed(_process_single_trial)(
+            X[ti].astype(np.float64), sfreq, freq_bands,
+            nperseg, reg, n_ch, n_bands
+        ) for ti in range(n_trials)
+    )
+    gc.collect()
+    return np.stack(results)
+
+print("✓ compute_csd_spd OK")
+
+# ── Global Precompute: EA ─────────────────────────────────────
+def ea_align_global(X_cov, metadata):
+    print("  Precomputing EA (GPU)...")
+    X   = torch.tensor(X_cov, dtype=torch.float32, device=DEVICE)
+    out = torch.empty_like(X)
+    for subj in metadata["subject"].unique():
+        idx   = np.where(metadata["subject"].values == subj)[0]
+        idx_t = torch.tensor(idx, device=DEVICE)
+        for bi in range(N_BANDS):
+            R = X[idx_t, bi].mean(0)
+            W = torch_invsqrtm_batch(R)
+            out[idx_t, bi] = W @ X[idx_t, bi] @ W.T
+    result = out.cpu().numpy().astype(np.float32)
+    del X, out
+    torch.cuda.empty_cache()
+    gc.collect()
+    print("  ✓ EA done")
+    return result
+
+# ── Global Precompute: GTA ────────────────────────────────────
+def gta_align_global(X_cov, metadata):
+    print("  Precomputing GTA (GPU, Riemannian)...")
+    X   = torch.tensor(X_cov, dtype=torch.float32, device=DEVICE)
+    out = torch.empty_like(X)
+    cols = [c for c in ["subject", "session"] if c in metadata.columns]
+    keys = list(zip(*[metadata[c].values for c in cols]))
+    blocks = {}
+    for gi, key in enumerate(keys):
+        blocks.setdefault(key, []).append(gi)
+    for idx_list in blocks.values():
+        idx   = torch.tensor(idx_list, device=DEVICE)
+        Xs    = X[idx]
+        n     = len(Xs)
+        out_s = torch.empty_like(Xs)
+        for bi in range(N_BANDS):
+            M = Xs[0, bi].clone()
+            for t in range(n):
+                alpha = 1.0 / min(t + 1, WINDOW)
+                W     = torch_invsqrtm_batch(M)
+                Wtmp  = W @ Xs[t, bi] @ W
+                eigv, eigvc = torch.linalg.eigh(Wtmp)
+                eigv  = eigv.clamp(min=_EIG_FLOOR)
+                Msq   = torch_sqrtm_batch(M)
+                M     = Msq @ ((eigvc * (eigv ** alpha).unsqueeze(-2)) @ eigvc.T) @ Msq
+                Wout  = torch_invsqrtm_batch(M)
+                out_s[t, bi] = Wout @ Xs[t, bi] @ Wout.T
+        out[idx] = out_s
+    result = out.cpu().numpy().astype(np.float32)
+    del X, out
+    torch.cuda.empty_cache()
+    gc.collect()
+    print("  ✓ GTA done")
+    return result
+
+# ── Global Precompute: Tangent Features + PCA ─────────────────
+def _compute_raw_tangent(X_cov):
+    X = torch.tensor(X_cov, dtype=torch.float32, device=DEVICE)
+    n, nb, d, _ = X.shape
+    idx   = torch.triu_indices(d, d)
+    scale = torch.ones(len(idx[0]), device=DEVICE)
+    scale[idx[0] != idx[1]] = np.sqrt(2)
+    feats = []
+    for bi in range(nb):
+        logs = torch_logm_batch(X[:, bi])
+        ref  = logs.mean(0)
+        S    = logs - ref
+        F    = S[:, idx[0], idx[1]] * scale
+        feats.append(F)
+    result = torch.cat(feats, dim=1).cpu().numpy().astype(np.float32)
+    del X
+    torch.cuda.empty_cache()
+    gc.collect()
+    return result
+
+def tangent_features_global(X_cov, n_components=TV_N_COMPONENTS):
+    print("  Precomputing Tangent Features (GPU + PCA)...")
+    raw = _compute_raw_tangent(X_cov)
+    pca = PCA(n_components=n_components, random_state=42)
+    result = pca.fit_transform(raw).astype(np.float32)
+    var_explained = pca.explained_variance_ratio_.sum()
+    print(f"  ✓ Tangent Features — {raw.shape[1]} → {n_components} dims ({var_explained:.1%} variance)")
+    return result, pca
+
+def apply_tangent_pca(X_cov, pca):
+    raw = _compute_raw_tangent(X_cov)
+    return pca.transform(raw).astype(np.float32)
+
+print("✓ Global Precompute Functions OK")
+
+# ── RCoMET Model ──────────────────────────────────────────────
+class _LogEuclideanLayer(nn.Module):
+    def forward(self, cov):
+        B, nb, d, _ = cov.shape
+        x = cov.reshape(B * nb, d, d)
+        return torch_logm_batch(x).reshape(B, nb, d, d)
+
+class _MambaEncoder(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+        self.input_proj   = nn.Linear(input_dim, RCOMET_D_MODEL)
+        self.mamba_layers = nn.ModuleList([
+            Mamba(d_model=RCOMET_D_MODEL, d_state=RCOMET_D_STATE,
+                  d_conv=RCOMET_D_CONV, expand=RCOMET_EXPAND)
+            for _ in range(RCOMET_LAYERS)
+        ])
+        self.norm_layers = nn.ModuleList([
+            nn.LayerNorm(RCOMET_D_MODEL) for _ in range(RCOMET_LAYERS)
+        ])
+        self.dropout = nn.Dropout(RCOMET_DROPOUT)
+        self.pool    = nn.AdaptiveAvgPool1d(1)
+
+    def forward(self, x):
+        x = self.input_proj(x)
+        for mamba, norm in zip(self.mamba_layers, self.norm_layers):
+            residual = x
+            x = norm(x)
+            x = mamba(x)
+            x = self.dropout(x)
+            x = x + residual
+        return self.pool(x.transpose(1, 2)).squeeze(-1)
+
+class RCoMET(nn.Module):
+    def __init__(self, channels, n_classes):
+        super().__init__()
+        self.log_euclidean = _LogEuclideanLayer()
+        self.encoder       = _MambaEncoder(channels)
+        self.classifier    = nn.Linear(RCOMET_D_MODEL, n_classes)
+
+    def forward(self, cov):
+        B, nb, d, _ = cov.shape
+        x = self.log_euclidean(cov)
+        x = x.view(B, nb * d, d)
+        x = self.encoder(x)
+        return self.classifier(x)
+
+print("✓ RCoMET OK")
+
+# ── Geodesic Augmentation (Production-Grade) ──────────────────
+def geodesic_augment_multiband(X, y, aug_ratio=0.05,
+                                subset_size=256, max_aug=32, rng=None):
+    if aug_ratio <= 0:
+        return X, y
+    if rng is None:
+        rng = np.random.default_rng()
+    n, nb, d, _ = X.shape
+    reg_eye     = 1e-4 * np.eye(d)
+    subset_size = min(subset_size, n)
+    subset_idx  = rng.choice(n, size=subset_size, replace=False)
+    X_sub = X[subset_idx]
+    y_sub = np.asarray(y)[subset_idx]
+    n_aug     = min(max_aug, max(8, int(subset_size * aug_ratio)))
+    class_idx = {c: np.where(y_sub == c)[0] for c in np.unique(y_sub)}
+    valid_cls = [c for c, idx in class_idx.items() if len(idx) >= 2]
+    if not valid_cls:
+        return X, y
+    X_syn, y_syn = [], []
+    for _ in range(n_aug):
+        cls   = valid_cls[rng.integers(len(valid_cls))]
+        idx   = class_idx[cls]
+        i, j  = rng.choice(idx, size=2, replace=False)
+        alpha = float(rng.uniform(0.1, 0.9))
+        C_syn = np.empty((nb, d, d), dtype=np.float32)
+        valid = True
+        for bi in range(nb):
+            try:
+                A = X_sub[i, bi].astype(np.float64) + reg_eye
+                B = X_sub[j, bi].astype(np.float64) + reg_eye
+                A_sqrt  = _sqrtm(A)
+                A_isqrt = _invsqrtm(A)
+                M       = A_isqrt @ B @ A_isqrt
+                w, v    = np.linalg.eigh(M)
+                w       = np.clip(w, _EIG_FLOOR, None)
+                M_alpha = (v * (w ** alpha)) @ v.T
+                C       = A_sqrt @ M_alpha @ A_sqrt
+                C       = 0.5 * (C + C.T) + reg_eye
+                if not np.isfinite(C).all():
+                    valid = False
+                    break
+                C_syn[bi] = C.astype(np.float32)
+            except Exception:
+                valid = False
+                break
+        if valid:
+            X_syn.append(C_syn)
+            y_syn.append(cls)
+    if not X_syn:
+        return X, y
+    X_aug = np.concatenate([X, np.stack(X_syn)])
+    y_aug = np.concatenate([y, np.array(y_syn, dtype=np.asarray(y).dtype)])
+    return X_aug, y_aug
+
+print("✓ Geodesic Augmentation OK (Production-Grade)")
+
+# ── PTClassifier ──────────────────────────────────────────────
+class PTClassifier:
+    def __init__(self, model, name="RCoMET"):
+        self.model = model.to(DEVICE)
+        self.name  = name
+
+    def _condition(self, X):
+        X   = np.asarray(X, dtype=np.float64)
+        nb  = X.shape[1]
+        d   = X.shape[-1]
+        eye = np.eye(d)
+        for bi in range(nb):
+            tr = np.mean(np.trace(X[:, bi], axis1=-2, axis2=-1))
+            if tr > 0:
+                X[:, bi] = X[:, bi] * (d / tr)
+            X[:, bi] += 1e-4 * eye
+        return X.astype(np.float32)
+
+    def fit(self, X, y):
+        if RCOMET_AUG_RATIO > 0:
+            rng  = np.random.default_rng(42)
+            X, y = geodesic_augment_multiband(
+                X, np.asarray(y),
+                aug_ratio=RCOMET_AUG_RATIO,
+                subset_size=AUG_SUBSET_SIZE,
+                max_aug=AUG_MAX_SAMPLES,
+                rng=rng,
+            )
+        X  = self._condition(X)
+        self.model.train()
+        Xt = torch.as_tensor(X)
+        yt = torch.as_tensor(np.asarray(y, dtype=np.int64))
+        loader = DataLoader(TensorDataset(Xt, yt),
+                            batch_size=RCOMET_BATCH, shuffle=True,
+                            pin_memory=True, num_workers=0)
+        opt    = optim.AdamW(self.model.parameters(),
+                             lr=RCOMET_LR, weight_decay=1e-4)
+        crit   = nn.CrossEntropyLoss()
+        scaler = torch.cuda.amp.GradScaler()
+
+        print(f"    Training {self.name} ({len(X)} trials, {RCOMET_EPOCHS} epochs)...")
+        for ep in range(RCOMET_EPOCHS):
+            running_loss = 0.0
+            for bx, by in loader:
+                bx = bx.to(DEVICE, non_blocking=True)
+                by = by.to(DEVICE, non_blocking=True)
+                opt.zero_grad()
+                with torch.cuda.amp.autocast():
+                    out  = self.model(bx)
+                    loss = crit(out, by)
+                scaler.scale(loss).backward()
+                scaler.unscale_(opt)
+                nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                scaler.step(opt)
+                scaler.update()
+                running_loss += loss.item()
+            print(f"    Epoch {ep+1:02d}/{RCOMET_EPOCHS} | loss={running_loss/len(loader):.4f}")
+        return self
+
+    def predict_proba(self, X):
+        X = self._condition(X)
+        self.model.eval()
+        with torch.no_grad(), torch.cuda.amp.autocast():
+            out = self.model(torch.as_tensor(X).to(DEVICE))
+        return torch.softmax(out, dim=1).cpu().numpy()
+
+print("✓ PTClassifier OK")
+
+# ── Helper: subsample source ──────────────────────────────────
+def subsample_src(idx, y, max_n, seed=42):
+    if len(idx) <= max_n:
+        return idx
+    rng         = np.random.default_rng(seed)
+    classes     = np.unique(y[idx])
+    n_per_class = max_n // len(classes)
+    selected    = []
+    for c in classes:
+        c_idx = idx[y[idx] == c]
+        n     = min(n_per_class, len(c_idx))
+        selected.append(rng.choice(c_idx, n, replace=False))
+    return np.concatenate(selected)
+
+# ── Load Data ─────────────────────────────────────────────────
+dataset  = PhysionetMI()
+paradigm = MotorImagery(n_classes=len(dataset.event_id))
+subjects = list(dataset.subject_list)[:N_SUBJECTS]
+
+print(f"\nLoading {len(subjects)} subjects...")
+
+X_list, y_list, m_list = [], [], []
+eeg_scale = None
+
+for subj in tqdm(subjects, desc="Loading"):
+    X, y, meta = paradigm.get_data(dataset=dataset, subjects=[subj])
+    Xf = filter_data(X.astype(np.float64), sfreq=SFREQ,
+                     l_freq=1.0, h_freq=40.0, verbose=False)
+    del X
+    gc.collect()
+    if eeg_scale is None:
+        rms       = float(np.sqrt(np.mean(Xf ** 2)))
+        eeg_scale = TARGET_RMS / rms if rms > 0 else 1.0
+        print(f"  EEG scale: {eeg_scale:.3e}")
+    Xf = (Xf * eeg_scale).astype(np.float32)
+    C_mb = compute_csd_spd(Xf, sfreq=SFREQ, freq_bands=FREQ_BANDS, reg=1e-4)
+    del Xf
+    gc.collect()
+    X_list.append(C_mb)
+    y_list.append(y)
+    m_list.append(meta)
+
+X_cov    = np.concatenate(X_list).astype(np.float32)
+y_full   = np.concatenate(y_list)
+metadata = pd.concat(m_list, ignore_index=True)
+del X_list, y_list, m_list
+gc.collect()
+
+le_enc    = LabelEncoder()
+y_enc     = le_enc.fit_transform(y_full)
+n_classes = len(le_enc.classes_)
+n_ch      = X_cov.shape[2]
+
+print(f"\n✓ Data: {X_cov.shape}, {n_classes} classes")
+
+# ── Global Precompute ─────────────────────────────────────────
+print("\n--- Global Precompute ---")
+X_ea            = ea_align_global(X_cov, metadata)
+X_gta           = gta_align_global(X_cov, metadata)
+X_eagta         = ea_align_global(X_gta, metadata)
+TV_raw, pca_raw = tangent_features_global(X_cov)
+TV_ea           = apply_tangent_pca(X_ea, pca_raw)
+print("✓ All precompute done\n")
+
+# ── LOSO Benchmark ────────────────────────────────────────────
+results  = []
+save_dir = "./PhysionetMotorImagery_results"
+os.makedirs(save_dir, exist_ok=True)
+
+def _bacc(y_true, proba):
+    return balanced_accuracy_score(y_true, np.argmax(proba, axis=1))
+
+def _f1(y_true, proba):
+    return f1_score(y_true, np.argmax(proba, axis=1),
+                    average="macro", zero_division=0)
+
+for target in tqdm(subjects, desc="LOSO"):
+    print(f"\n{'='*50}")
+    print(f"=== Subject {target} ===")
+    print(f"{'='*50}")
+
+    src_mask    = metadata["subject"].values != target
+    tgt_mask    = metadata["subject"].values == target
+    src_idx     = np.where(src_mask)[0]
+    tgt_idx     = np.where(tgt_mask)[0]
+    src_idx_sub = subsample_src(src_idx, y_enc, MAX_SRC_TRIALS)
+
+    print(f"  src: {len(src_idx)} → {len(src_idx_sub)} (sub), tgt: {len(tgt_idx)}")
+
+    y_src_sub  = y_enc[src_idx_sub]
+    y_src_full = y_enc[src_idx]
+    y_tgt      = y_enc[tgt_idx]
+
+    # 1. MDM-LE
+    try:
+        probas = []
+        for bi in range(N_BANDS):
+            mdm = MDM(metric="logeuclid")
+            mdm.fit(X_cov[src_idx_sub, bi].astype(np.float64), y_src_sub)
+            probas.append(mdm.predict_proba(X_cov[tgt_idx, bi].astype(np.float64)))
+        P = np.mean(probas, axis=0)
+        results.append({"subject": target, "method": "MDM-LE",
+                        "balanced_acc": _bacc(y_tgt, P), "f1": _f1(y_tgt, P)})
+        print(f"  MDM-LE: {_bacc(y_tgt, P):.3f}")
+    except Exception as e:
+        print(f"  MDM-LE FAILED: {e}")
+
+    # 2. TS+SVM
+    try:
+        clf = SVC(kernel="linear", C=1.0, probability=False, random_state=42)
+        clf.fit(TV_raw[src_idx_sub], y_src_sub)
+        pred = clf.predict(TV_raw[tgt_idx])
+        P = np.eye(n_classes)[pred]
+        results.append({"subject": target, "method": "TS+SVM",
+                        "balanced_acc": _bacc(y_tgt, P), "f1": _f1(y_tgt, P)})
+        print(f"  TS+SVM: {_bacc(y_tgt, P):.3f}")
+    except Exception as e:
+        print(f"  TS+SVM FAILED: {e}")
+
+    # 3. EA+TS+SVM
+    try:
+        clf = SVC(kernel="linear", C=1.0, probability=False, random_state=42)
+        clf.fit(TV_ea[src_idx_sub], y_src_sub)
+        pred = clf.predict(TV_ea[tgt_idx])
+        P = np.eye(n_classes)[pred]
+        results.append({"subject": target, "method": "EA+TS+SVM",
+                        "balanced_acc": _bacc(y_tgt, P), "f1": _f1(y_tgt, P)})
+        print(f"  EA+TS+SVM: {_bacc(y_tgt, P):.3f}")
+    except Exception as e:
+        print(f"  EA+TS+SVM FAILED: {e}")
+
+    # 4. RCoMET
+    try:
+        clf = PTClassifier(RCoMET(n_ch, n_classes), name="RCoMET")
+        clf.fit(X_cov[src_idx], y_src_full)
+        P = clf.predict_proba(X_cov[tgt_idx])
+        results.append({"subject": target, "method": "RCoMET",
+                        "balanced_acc": _bacc(y_tgt, P), "f1": _f1(y_tgt, P)})
+        print(f"  RCoMET: {_bacc(y_tgt, P):.3f}")
+    except Exception as e:
+        print(f"  RCoMET FAILED: {e}")
+
+    # 5. EA+RCoMET
+    try:
+        clf = PTClassifier(RCoMET(n_ch, n_classes), name="EA+RCoMET")
+        clf.fit(X_ea[src_idx], y_src_full)
+        P = clf.predict_proba(X_ea[tgt_idx])
+        results.append({"subject": target, "method": "EA+RCoMET",
+                        "balanced_acc": _bacc(y_tgt, P), "f1": _f1(y_tgt, P)})
+        print(f"  EA+RCoMET: {_bacc(y_tgt, P):.3f}")
+    except Exception as e:
+        print(f"  EA+RCoMET FAILED: {e}")
+
+      #6. GTA+RCoMET (فعلاً کامنت)
+    try:
+        clf = PTClassifier(RCoMET(n_ch, n_classes), name="GTA+RCoMET")
+        clf.fit(X_gta[src_idx], y_src_full)
+        P = clf.predict_proba(X_gta[tgt_idx])
+        results.append({"subject": target, "method": "GTA+RCoMET",
+                        "balanced_acc": _bacc(y_tgt, P), "f1": _f1(y_tgt, P)})
+        print(f"  GTA+RCoMET: {_bacc(y_tgt, P):.3f}")
+    except Exception as e:
+        print(f"  GTA+RCoMET FAILED: {e}")
+
+    # 7. EA+GTA+RCoMET (فعلاً کامنت)
+    try:
+        clf = PTClassifier(RCoMET(n_ch, n_classes), name="EA+GTA+RCoMET")
+        clf.fit(X_eagta[src_idx], y_src_full)
+        P = clf.predict_proba(X_eagta[tgt_idx])
+        results.append({"subject": target, "method": "EA+GTA+RCoMET",
+                        "balanced_acc": _bacc(y_tgt, P), "f1": _f1(y_tgt, P)})
+        print(f"  EA+GTA+RCoMET: {_bacc(y_tgt, P):.3f}")
+    except Exception as e:
+        print(f"  EA+GTA+RCoMET FAILED: {e}")
+
+    # Save after each subject
+    df = pd.DataFrame(results)
+    df.to_csv(os.path.join(save_dir, "metrics.csv"), index=False)
+    print(f"\n  Current means:")
+    print(df.groupby("method")["balanced_acc"].mean().round(3)
+          .sort_values(ascending=False).to_string())
+
+# ── Final ─────────────────────────────────────────────────────
+summary = pd.DataFrame(results)
+summary.to_csv("summary_all_datasets.csv", index=False)
+print("\n✅ Benchmark complete!")
+print(summary.groupby("method")["balanced_acc"]
+      .mean().round(3).sort_values(ascending=False))
